@@ -100,21 +100,20 @@ export default function (amp: PluginAPI) {
 	}
 
 	// When each thread's latest turn started, for the per-turn cache line. In memory only, so
-	// threads whose turn started before the plugin loaded fall back to lifetime totals.
+	// a thread whose turn started before the plugin loaded shows no cache line until its next turn.
 	const turnStarts = new Map<string, Date>()
 
 	async function cacheLine(threadID: string): Promise<string | null> {
 		const start = turnStarts.get(threadID)
+		if (!start) return null
 		// --start requires --end; leave headroom for requests still landing.
 		const end = new Date(Date.now() + 60_000).toISOString()
-		const { exitCode, stdout } = start
-			? await amp.$`${AMP} threads usage ${threadID} --details --start ${start.toISOString()} --end ${end}`
-			: await amp.$`${AMP} threads usage ${threadID} --details`
+		const { exitCode, stdout } =
+			await amp.$`${AMP} threads usage ${threadID} --details --start ${start.toISOString()} --end ${end}`
 		const share = exitCode === 0 ? parseCacheShare(stdout) : null
 		if (!share) return null
 		const pct = Math.round((share.cacheReads / share.input) * 100)
-		const scope = start ? 'latest turn' : 'lifetime'
-		return `Cache ${pct}% hit, ${scope} (${formatTokens(share.cacheReads)} / ${formatTokens(share.input)})`
+		return `Cache ${pct}% hit, latest turn (${formatTokens(share.cacheReads)} / ${formatTokens(share.input)})`
 	}
 
 	amp.on('session.start', (_event, ctx) => void refresh(ctx.thread))
