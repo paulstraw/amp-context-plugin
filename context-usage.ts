@@ -13,7 +13,7 @@ interface ContextReport {
 	totalTokens: number
 	maxContextTokens: number
 	compactionCount: number
-	sections: { name: string; tokens: number }[]
+	sections: { id: string; name: string; tokens: number }[]
 }
 
 // Plugins launched by the desktop app may not inherit the shell PATH.
@@ -32,8 +32,19 @@ export function formatLabel(r: ContextReport): string {
 	return `${ratio >= WARN_AT ? '⚠ ' : ''}${label}${compacted}`
 }
 
+// The Mac app's toast shows about three lines, so keep section names short.
+const SHORT_SECTION_NAMES: Record<string, string> = {
+	'system-prompt': 'System',
+	'builtin-tools': 'Tools',
+	'mcp-tools': 'MCP',
+	'loaded-skills': 'Skills',
+	messages: 'Messages',
+}
+
 export function formatSections(r: ContextReport): string {
-	return r.sections.map((s) => `${s.name} ${formatTokens(s.tokens)}`).join(' · ')
+	return r.sections
+		.map((s) => `${SHORT_SECTION_NAMES[s.id] ?? s.name} ${formatTokens(s.tokens)}`)
+		.join(' · ')
 }
 
 /**
@@ -103,7 +114,7 @@ export default function (amp: PluginAPI) {
 		if (!share) return null
 		const pct = Math.round((share.cacheReads / share.input) * 100)
 		const scope = start ? 'latest turn' : 'lifetime'
-		return `Cache: ${pct}% of input read from cache (${formatTokens(share.cacheReads)} / ${formatTokens(share.input)}, ${scope})`
+		return `Cache ${pct}% hit, ${scope} (${formatTokens(share.cacheReads)} / ${formatTokens(share.input)})`
 	}
 
 	amp.on('session.start', (_event, ctx) => void refresh(ctx.thread))
@@ -124,7 +135,8 @@ export default function (amp: PluginAPI) {
 			if (!ctx.thread) return void (await ctx.ui.notify('No active thread.'))
 			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread.id)])
 			if (!report) return void (await ctx.ui.notify('Context usage is unavailable for this thread.'))
-			const lines = [formatLabel(report), formatSections(report)]
+			// The button already shows the total; the toast only has room for the details.
+			const lines = [formatSections(report)]
 			if (cache) lines.push(cache)
 			await ctx.ui.notify(lines.join('\n'))
 		},
