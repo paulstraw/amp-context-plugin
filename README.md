@@ -1,12 +1,10 @@
 # amp-context-plugin
 
-An Amp plugin that shows the active thread's context window usage in the desktop app's status bar, e.g. `ctx 68k / 872k (8%)`. Works for Claude Code threads.
+An Amp plugin that shows each thread's context window usage as a button above the composer, e.g. `ctx 68k / 872k (8%)`. Works for Claude Code threads in the macOS app.
 
-- Reads `amp threads context <thread>` and refreshes at the end of each turn, after tool results (at most every 30s), and when you switch threads.
+- Reads `amp threads context <thread>` and refreshes when a thread session starts, at the end of each turn, and after tool results (at most every 30s per thread).
 - Prefixes `⚠` at 80% and appends `· N×` after compactions.
-- Click it (or run **context-usage: Show context details** from ⌘K) for the per-section breakdown and the cache-read share of the latest turn, parsed from `amp threads usage --details`.
-
-Uses the experimental `createStatusItem` API, so it may break with Amp updates.
+- Click the button (or run **context-usage: Show context details** from ⌘K) for the per-section breakdown and the cache-read share of the latest turn, parsed from `amp threads usage --details`.
 
 ## Install
 

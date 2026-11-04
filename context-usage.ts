@@ -1,9 +1,9 @@
-import type { PluginAPI, StatusItem } from '@ampcode/plugin'
+import type { PluginAPI, PluginThread, QuickAction } from '@ampcode/plugin'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export const description =
-	'Shows the active thread’s context window usage in the status bar, from `amp threads context`.'
+	'Shows each thread’s context window usage as a button above the composer, from `amp threads context`.'
 
 const WARN_AT = 0.8
 const TOOL_REFRESH_MS = 30_000
@@ -49,25 +49,10 @@ export function parseCacheShare(usageMarkdown: string): { input: number; cacheRe
 }
 
 export default function (amp: PluginAPI) {
-	const experimental = amp.experimental
-	if (!experimental) {
-		amp.logger.log('context-usage: experimental APIs unavailable; status item disabled')
-		return
-	}
-
-	let item: StatusItem | null = null
-	let latestRequest = 0
-
-	function show(text: string) {
-		const value = { text, url: `command:${DETAILS_COMMAND}` }
-		if (item) item.update(value)
-		else item = experimental!.createStatusItem(value)
-	}
-
-	function hide() {
-		item?.unsubscribe()
-		item = null
-	}
+	// One button per thread. The Mac app doesn't render status items and reports no active
+	// thread, so each thread gets its own quick action instead.
+	const buttons = new Map<string, QuickAction>()
+	const latestRequest = new Map<string, number>()
 
 	async function readContext(threadID: string): Promise<ContextReport> {
 		const { exitCode, stdout, stderr } = await amp.$`${AMP} threads context ${threadID}`
@@ -75,18 +60,30 @@ export default function (amp: PluginAPI) {
 		return JSON.parse(stdout) as ContextReport
 	}
 
-	async function refresh(threadID: string): Promise<ContextReport | null> {
-		const request = ++latestRequest
+	async function refresh(thread: PluginThread): Promise<ContextReport | null> {
+		const request = (latestRequest.get(thread.id) ?? 0) + 1
+		latestRequest.set(thread.id, request)
 		try {
-			const report = await readContext(threadID)
-			// Drop results for threads the user has since left, or superseded by a newer refresh.
-			if (request === latestRequest && amp.activeThread.current?.id === threadID) {
-				show(formatLabel(report))
+			const report = await readContext(thread.id)
+			// Drop results superseded by a newer refresh of the same thread.
+			if (latestRequest.get(thread.id) === request) {
+				const definition = {
+					text: formatLabel(report),
+					icon: 'activity',
+					action: 'run-command',
+					args: { command: DETAILS_COMMAND },
+				} as const
+				const button = buttons.get(thread.id)
+				if (button) button.update(definition)
+				else buttons.set(thread.id, thread.createQuickAction(definition))
 			}
 			return report
 		} catch (error) {
-			amp.logger.log(`context-usage: refresh failed for ${threadID}: ${String(error)}`)
-			if (request === latestRequest) hide()
+			amp.logger.log(`context-usage: refresh failed for ${thread.id}: ${String(error)}`)
+			if (latestRequest.get(thread.id) === request) {
+				buttons.get(thread.id)?.unsubscribe()
+				buttons.delete(thread.id)
+			}
 			return null
 		}
 	}
@@ -109,13 +106,7 @@ export default function (amp: PluginAPI) {
 		return `Cache: ${pct}% of input read from cache (${formatTokens(share.cacheReads)} / ${formatTokens(share.input)}, ${scope})`
 	}
 
-	amp.activeThread.subscribe((thread) => {
-		if (thread) void refresh(thread.id)
-		else {
-			latestRequest++
-			hide()
-		}
-	})
+	amp.on('session.start', (_event, ctx) => void refresh(ctx.thread))
 
 	amp.on('agent.start', (event) => {
 		turnStarts.set(event.thread.id, new Date())
@@ -131,8 +122,7 @@ export default function (amp: PluginAPI) {
 		},
 		async (ctx) => {
 			if (!ctx.thread) return void (await ctx.ui.notify('No active thread.'))
-			const threadID = ctx.thread.id
-			const [report, cache] = await Promise.all([refresh(threadID), cacheLine(threadID)])
+			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread.id)])
 			if (!report) return void (await ctx.ui.notify('Context usage is unavailable for this thread.'))
 			const lines = [formatLabel(report), formatSections(report)]
 			if (cache) lines.push(cache)
@@ -140,17 +130,14 @@ export default function (amp: PluginAPI) {
 		},
 	)
 
-	amp.on('agent.end', (event) => {
-		if (amp.activeThread.current?.id === event.thread.id) void refresh(event.thread.id)
-	})
+	amp.on('agent.end', (_event, ctx) => void refresh(ctx.thread))
 
-	// Long turns make many tool calls; refresh mid-turn, but at most every 30s.
-	let lastToolRefresh = 0
-	amp.on('tool.result', (event) => {
-		if (amp.activeThread.current?.id !== event.thread.id) return
+	// Long turns make many tool calls; refresh mid-turn, but at most every 30s per thread.
+	const lastToolRefresh = new Map<string, number>()
+	amp.on('tool.result', (event, ctx) => {
 		const now = Date.now()
-		if (now - lastToolRefresh < TOOL_REFRESH_MS) return
-		lastToolRefresh = now
-		void refresh(event.thread.id)
+		if (now - (lastToolRefresh.get(event.thread.id) ?? 0) < TOOL_REFRESH_MS) return
+		lastToolRefresh.set(event.thread.id, now)
+		void refresh(ctx.thread)
 	})
 }
