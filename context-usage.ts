@@ -6,6 +6,7 @@ export const description =
 	'Shows the active thread’s context window usage in the status bar, from `amp threads context`.'
 
 const WARN_AT = 0.8
+const TOOL_REFRESH_MS = 30_000
 
 interface ContextReport {
 	totalTokens: number
@@ -78,5 +79,15 @@ export default function (amp: PluginAPI) {
 
 	amp.on('agent.end', (event) => {
 		if (amp.activeThread.current?.id === event.thread.id) void refresh(event.thread.id)
+	})
+
+	// Long turns make many tool calls; refresh mid-turn, but at most every 30s.
+	let lastToolRefresh = 0
+	amp.on('tool.result', (event) => {
+		if (amp.activeThread.current?.id !== event.thread.id) return
+		const now = Date.now()
+		if (now - lastToolRefresh < TOOL_REFRESH_MS) return
+		lastToolRefresh = now
+		void refresh(event.thread.id)
 	})
 }
