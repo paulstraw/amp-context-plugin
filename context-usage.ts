@@ -32,7 +32,7 @@ export function formatLabel(r: ContextReport): string {
 	return `${ratio >= WARN_AT ? '⚠ ' : ''}${label}${compacted}`
 }
 
-// The Mac app's toast shows about three lines, so keep section names short.
+// Short section names keep the breakdown on one line.
 const SHORT_SECTION_NAMES: Record<string, string> = {
 	'system-prompt': 'System',
 	'builtin-tools': 'Tools',
@@ -99,12 +99,27 @@ export default function (amp: PluginAPI) {
 		}
 	}
 
-	// When each thread's latest turn started, for the per-turn cache line. In memory only, so
-	// a thread whose turn started before the plugin loaded shows no cache line until its next turn.
+	// When each thread's latest turn started, as seen at agent.start. Used when the thread's
+	// messages don't say, e.g. if they lack timestamps.
 	const turnStarts = new Map<string, Date>()
 
-	async function cacheLine(threadID: string): Promise<string | null> {
-		const start = turnStarts.get(threadID)
+	// The latest turn starts at the newest user message that carries text rather than only
+	// tool results. Reading it from the thread also works for turns that began before a reload.
+	async function findTurnStart(thread: PluginThread): Promise<Date | undefined> {
+		for (let offset = 0; offset < 200; offset += 20) {
+			const page = await thread.messages({ from: 'end', offset, limit: 20, roles: ['user'] })
+			const prompt = [...page]
+				.reverse()
+				.find((m) => m.role === 'user' && m.content.some((block) => block.type === 'text'))
+			if (prompt?.createdAt) return new Date(prompt.createdAt)
+			if (prompt || page.length < 20) break
+		}
+		return turnStarts.get(thread.id)
+	}
+
+	async function cacheLine(thread: PluginThread): Promise<string | null> {
+		const threadID = thread.id
+		const start = await findTurnStart(thread).catch(() => turnStarts.get(threadID))
 		if (!start) return null
 		// --start requires --end; leave headroom for requests still landing.
 		const end = new Date(Date.now() + 60_000).toISOString()
@@ -132,12 +147,17 @@ export default function (amp: PluginAPI) {
 		},
 		async (ctx) => {
 			if (!ctx.thread) return void (await ctx.ui.notify('No active thread.'))
-			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread.id)])
+			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread)])
 			if (!report) return void (await ctx.ui.notify('Context usage is unavailable for this thread.'))
-			// The button already shows the total; the toast only has room for the details.
+			// A dialog rather than a toast, which disappears too quickly to read.
 			const lines = [formatSections(report)]
 			if (cache) lines.push(cache)
-			await ctx.ui.notify(lines.join('\n'))
+			await ctx.ui.confirm({
+				title: formatLabel(report),
+				message: lines.join('\n\n'),
+				confirmButtonText: 'Close',
+				skipIfUnwatched: true,
+			})
 		},
 	)
 
