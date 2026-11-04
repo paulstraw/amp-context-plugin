@@ -1,4 +1,5 @@
 import type { PluginAPI, PluginThread, QuickAction } from '@ampcode/plugin'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,6 +9,7 @@ export const description =
 const WARN_AT = 0.8
 const TOOL_REFRESH_MS = 30_000
 const DETAILS_COMMAND = 'context-usage-details'
+const MAX_SAVED_TURN_STARTS = 200
 
 interface ContextReport {
 	totalTokens: number
@@ -99,32 +101,38 @@ export default function (amp: PluginAPI) {
 		}
 	}
 
-	// When each thread's latest turn started, as seen at agent.start. Used when the thread's
-	// messages don't say, e.g. if they lack timestamps.
-	const turnStarts = new Map<string, Date>()
-
-	// The latest turn starts at the newest user message that carries text rather than only
-	// tool results. Reading it from the thread also works for turns that began before a reload.
-	async function findTurnStart(thread: PluginThread): Promise<Date | undefined> {
-		for (let offset = 0; offset < 200; offset += 20) {
-			const page = await thread.messages({ from: 'end', offset, limit: 20, roles: ['user'] })
-			const prompt = [...page]
-				.reverse()
-				.find((m) => m.role === 'user' && m.content.some((block) => block.type === 'text'))
-			if (prompt?.createdAt) return new Date(prompt.createdAt)
-			if (prompt || page.length < 20) break
+	// When each thread's latest turn started, as seen at agent.start. Thread messages carry no
+	// timestamps, so this is the only source; it is saved to disk to survive plugin reloads.
+	const turnStartsFile = join(amp.system.cacheDirectory, 'turn-starts.json')
+	const turnStarts = new Map<string, string>()
+	try {
+		for (const [id, at] of Object.entries(JSON.parse(readFileSync(turnStartsFile, 'utf8')))) {
+			if (typeof at === 'string') turnStarts.set(id, at)
 		}
-		return turnStarts.get(thread.id)
+	} catch {
+		// No saved turn starts yet.
 	}
 
-	async function cacheLine(thread: PluginThread): Promise<string | null> {
-		const threadID = thread.id
-		const start = await findTurnStart(thread).catch(() => turnStarts.get(threadID))
+	function recordTurnStart(threadID: string) {
+		turnStarts.delete(threadID)
+		turnStarts.set(threadID, new Date().toISOString())
+		// Keep the most recently started threads only.
+		for (const id of [...turnStarts.keys()].slice(0, -MAX_SAVED_TURN_STARTS)) turnStarts.delete(id)
+		try {
+			mkdirSync(amp.system.cacheDirectory, { recursive: true })
+			writeFileSync(turnStartsFile, JSON.stringify(Object.fromEntries(turnStarts)))
+		} catch (error) {
+			amp.logger.log(`context-usage: saving turn starts failed: ${String(error)}`)
+		}
+	}
+
+	async function cacheLine(threadID: string): Promise<string | null> {
+		const start = turnStarts.get(threadID)
 		if (!start) return null
 		// --start requires --end; leave headroom for requests still landing.
 		const end = new Date(Date.now() + 60_000).toISOString()
 		const { exitCode, stdout } =
-			await amp.$`${AMP} threads usage ${threadID} --details --start ${start.toISOString()} --end ${end}`
+			await amp.$`${AMP} threads usage ${threadID} --details --start ${start} --end ${end}`
 		const share = exitCode === 0 ? parseCacheShare(stdout) : null
 		if (!share) return null
 		const pct = Math.round((share.cacheReads / share.input) * 100)
@@ -134,7 +142,7 @@ export default function (amp: PluginAPI) {
 	amp.on('session.start', (_event, ctx) => void refresh(ctx.thread))
 
 	amp.on('agent.start', (event) => {
-		turnStarts.set(event.thread.id, new Date())
+		recordTurnStart(event.thread.id)
 		return {}
 	})
 
@@ -147,7 +155,7 @@ export default function (amp: PluginAPI) {
 		},
 		async (ctx) => {
 			if (!ctx.thread) return void (await ctx.ui.notify('No active thread.'))
-			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread)])
+			const [report, cache] = await Promise.all([refresh(ctx.thread), cacheLine(ctx.thread.id)])
 			if (!report) return void (await ctx.ui.notify('Context usage is unavailable for this thread.'))
 			// A dialog rather than a toast, which disappears too quickly to read.
 			const lines = [formatSections(report)]
